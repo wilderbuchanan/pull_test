@@ -139,4 +139,15 @@ def main():
             try:
                 try_port(p, b, args.per_try_seconds, args.send_every, nudges)
             except KeyboardInterrupt:
-                print(f"\n[{ts()}] Interrup
+                print(f"\n[{ts()}] Interrupted by user.", file=sys.stderr)
+                sys.exit(1)
+            except Exception as e:
+                print(f"[{ts()}] ❗ {p}@{b} error: {e}", file=sys.stderr)
+
+    if not any_tried:
+        print(f"[{ts()}] Done. No ports/bauds tried.", file=sys.stderr)
+    else:
+        print(f"[{ts()}] ✅ Scan complete.", file=sys.stderr)
+
+if __name__ == "__main__":
+    main()
