@@ -2,7 +2,7 @@
 import serial, binascii, time, re
 
 PORT = "/dev/ttyUSB0"
-BAUD = 19200
+BAUD = 9600
 TIMEOUT = 0.2  # seconds
 
 unit_map = {
