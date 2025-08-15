@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-# Produces a clean 1-page PDF from data/<test>.csv (time,force_N,force_kgf,sample)
+# Produces a clean 1-page PDF from data/<test>.csv
 # - Prompts for test name (accepts 'test-1' or 'test-1.csv')
-# - Converts HH:MM:SS -> seconds
+# - Tolerates header variants: time/timestamp/t/seconds/ms and force_N/force_kgf/force/kgf
+# - Converts HH:MM:SS -> seconds (handles midnight wrap); numeric seconds and datetimes also supported
 # - Computes max force, impulse (area under curve), optional energy (if speed given)
+# - Plots N on the left axis; optional kgf on the right axis
 # - Saves PDF next to CSV
 
-import os, math, csv, sys, time, re
+import os, sys, re, csv
 from pathlib import Path
 from datetime import datetime
 
@@ -18,6 +20,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 DATA_DIR = Path("data")
 N_PER_KGF = 9.80665
 
+# ---------- Helpers ----------
 def list_csvs():
     if not DATA_DIR.exists():
         return []
@@ -28,19 +31,19 @@ def suggest_from_last():
     if not files:
         return "test-"
     stem = files[0].stem
-    # strip trailing digits (so 'test-1' -> 'test-')
-    base = re.sub(r"\d+$", "", stem)
-    return base if base else (stem[:-1] if stem else "test-")
+    base = re.sub(r"\d+$", "", stem) or (stem[:-1] if stem else "test-")
+    return base
 
-def parse_hms_list_to_seconds(hms_list):
-    """Convert ['HH:MM:SS', ...] to seconds since first point, handling midnight wrap."""
+def _parse_hhmmss_to_sec_list(hms_list):
+    """Convert ['HH:MM:SS(.sss)', ...] to seconds since first point, handling midnight wrap."""
     secs = []
     base = None
     accum_day = 0.0
     last_abs = None
     for s in hms_list:
+        s = s.strip()
         try:
-            hh, mm, ss = s.strip().split(":")
+            hh, mm, ss = s.split(":")
             x = int(hh) * 3600 + int(mm) * 60 + float(ss)
         except Exception:
             secs.append(float("nan"))
@@ -53,50 +56,20 @@ def parse_hms_list_to_seconds(hms_list):
         last_abs = x
     return secs
 
-def read_logger_csv(path: Path):
-    """Read CSV from read_force.py. Columns: time, force_N, force_kgf, sample"""
-    with path.open("r", encoding="utf-8") as f:
-        rdr = csv.DictReader(f)
-        times, force_N, force_kgf, sample = [], [], [], None
-        has_N = "force_N" in rdr.fieldnames
-        has_K = "force_kgf" in rdr.fieldnames
-        if not ("time" in rdr.fieldnames and (has_N or has_K)):
-            raise RuntimeError("CSV must contain 'time' and 'force_N' or 'force_kgf' columns.")
-        for row in rdr:
-            times.append(row.get("time", "").strip())
-            if has_N and row.get("force_N", "") != "":
-                try:
-                    force_N.append(float(row["force_N"]))
-                except:
-                    force_N.append(float("nan"))
-            elif has_K and row.get("force_kgf", "") != "":
-                # fallback: convert kgf to N
-                try:
-                    force_N.append(float(row["force_kgf"]) * N_PER_KGF)
-                except:
-                    force_N.append(float("nan"))
-            else:
-                force_N.append(float("nan"))
-            if has_K and row.get("force_kgf", "") != "":
-                try:
-                    force_kgf.append(float(row["force_kgf"]))
-                except:
-                    force_kgf.append(float("nan"))
-            sname = row.get("sample", None)
-            if sname:
-                sample = sname
-    t_sec = parse_hms_list_to_seconds(times)
-    if not sample:
-        sample = path.stem
-    return np.array(t_sec, dtype=float), np.array(force_N, dtype=float), sample
+def _to_float_array(vals):
+    out = []
+    for v in vals:
+        try:
+            out.append(float(v))
+        except Exception:
+            out.append(float("nan"))
+    return np.array(out, dtype=float)
 
-def finite_xy(x, y):
-    mask = np.isfinite(x) & np.isfinite(y)
-    return x[mask], y[mask]
-
-def integrate_trapz(y, x):
-    # Robust trapezoid integration; avoid deprecation issues
-    if len(x) < 2 or len(y) < 2:
+def integrate_trapezoid(y, x):
+    """Stable trapezoid integral that ignores non-increasing time steps."""
+    y = np.asarray(y, dtype=float)
+    x = np.asarray(x, dtype=float)
+    if y.size < 2 or x.size < 2:
         return 0.0
     area = 0.0
     for i in range(len(x) - 1):
@@ -105,42 +78,189 @@ def integrate_trapz(y, x):
             area += 0.5 * (y[i] + y[i+1]) * dt
     return area
 
+def finite_xy(x, y):
+    m = np.isfinite(x) & np.isfinite(y)
+    return x[m], y[m]
+
+# ---------- CSV loader (robust to variants) ----------
+def read_logger_csv(path: Path):
+    """
+    Load CSV with typical columns written by read_force.py:
+      - time (HH:MM:SS) or numeric seconds (or 'timestamp', 't', 'seconds', 'ms')
+      - force_N or force_kgf (or 'force', 'kgf')
+      - optional 'sample'
+    Returns: t_seconds (np.array), F_N (np.array), sample_name (str)
+    """
+    if not path.exists():
+        raise FileNotFoundError(path)
+
+    # Try to sniff the dialect; fall back to comma
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            preview = f.read(2048)
+        dialect = csv.Sniffer().sniff(preview, delimiters=",;\t ")
+        has_header = csv.Sniffer().has_header(preview)
+    except Exception:
+        dialect = csv.get_dialect("excel")
+        has_header = True
+
+    with path.open("r", encoding="utf-8") as f:
+        rdr = csv.reader(f, dialect)
+        rows = list(rdr)
+
+    if not rows:
+        raise RuntimeError("CSV appears empty.")
+
+    # Headers
+    if has_header:
+        headers = [c.strip().lower() for c in rows[0]]
+        data_rows = rows[1:]
+    else:
+        # Assume default header if not present
+        headers = ["time", "force_n"]
+        data_rows = rows
+
+    # Build name → index map
+    idx = {name: i for i, name in enumerate(headers)}
+
+    # Find time-like and force-like columns
+    time_candidates = ["time", "timestamp", "t", "datetime", "seconds", "ms"]
+    forceN_candidates = ["force_n", "forcen", "f_n", "n", "force"]
+    forceK_candidates = ["force_kgf", "forcekgf", "f_kgf", "kgf"]
+
+    def find_col(cands):
+        for c in cands:
+            if c in idx:
+                return idx[c], c
+        return None, None
+
+    ti, tname = find_col(time_candidates)
+    if ti is None:
+        raise RuntimeError("No time-like column found (need one of: time/timestamp/t/datetime/seconds/ms).")
+
+    ni, nname = find_col(forceN_candidates)
+    ki, kname = find_col(forceK_candidates)
+
+    if ni is None and ki is None:
+        raise RuntimeError("No force column found (need one of: force_N/force_kgf/force/kgf).")
+
+    si, _ = find_col(["sample", "name", "test", "test_name"])
+
+    # Extract columns as lists of strings (guarding short rows)
+    def col(i):
+        return [row[i].strip() if i is not None and i < len(row) else "" for row in data_rows]
+
+    t_raw = col(ti)
+    F_N = None
+
+    # Time parsing:
+    # 1) If numeric, use directly as seconds
+    # 2) If looks like HH:MM:SS(.sss), convert with wrap handling
+    # 3) If other date/time string, try fromisoformat, else NaN
+    numeric_time = True
+    for s in t_raw:
+        try:
+            float(s)
+        except Exception:
+            numeric_time = False
+            break
+
+    if numeric_time:
+        t_sec = _to_float_array(t_raw)
+    else:
+        # HH:MM:SS?
+        if all((":" in s) for s in t_raw if s):
+            t_sec = np.array(_parse_hhmmss_to_sec_list(t_raw), dtype=float)
+            # If all NaN (unlikely), fall through to ISO attempts
+            if np.all(~np.isfinite(t_sec)):
+                # Try ISO/datetime
+                dt_vals = []
+                for s in t_raw:
+                    s = s.replace("Z", "+00:00")
+                    try:
+                        dt = datetime.fromisoformat(s)
+                        dt_vals.append(dt)
+                    except Exception:
+                        dt_vals.append(None)
+                if all(v is None for v in dt_vals):
+                    raise RuntimeError("Could not parse 'time' column.")
+                t0 = next(v for v in dt_vals if v is not None)
+                t_sec = np.array([(v - t0).total_seconds() if v else np.nan for v in dt_vals], dtype=float)
+        else:
+            # ISO/datetime
+            dt_vals = []
+            for s in t_raw:
+                s = s.replace("Z", "+00:00")
+                try:
+                    dt = datetime.fromisoformat(s)
+                    dt_vals.append(dt)
+                except Exception:
+                    # last resort: treat as HH:MM:SS without date
+                    if ":" in s:
+                        dt_vals.append(None)
+                    else:
+                        dt_vals.append(None)
+            if all(v is None for v in dt_vals):
+                # fallback to HH:MM:SS converter anyway
+                t_sec = np.array(_parse_hhmmss_to_sec_list(t_raw), dtype=float)
+            else:
+                t0 = next(v for v in dt_vals if v is not None)
+                t_sec = np.array([(v - t0).total_seconds() if v else np.nan for v in dt_vals], dtype=float)
+
+    # Force parsing: prefer N if present; else kgf → N
+    if ni is not None:
+        F_N = _to_float_array(col(ni))
+    elif ki is not None:
+        F_N = _to_float_array(col(ki)) * N_PER_KGF
+
+    sample = None
+    if si is not None:
+        svals = col(si)
+        if svals:
+            sample = svals[0] or path.stem
+    if not sample:
+        sample = path.stem
+
+    return t_sec, F_N, sample
+
+# ---------- Main ----------
 def main():
-    # Prompt for name with smart default
+    # Prompt for test name (smart default from latest CSV)
     default = suggest_from_last()
-    name = input(f"Enter test name [{default}]: ").strip()
-    if not name:
-        name = default
+    name = input(f"Enter test name [{default}]: ").strip() or default
     if name.lower().endswith(".csv"):
         name = name[:-4]
     csv_path = DATA_DIR / f"{name}.csv"
     if not csv_path.exists():
-        print(f"File not found: {csv_path}\nAvailable CSVs:")
-        for p in list_csvs()[:10]:
-            print("  -", p.name)
+        # keep output minimal but helpful
+        print(f"File not found: {csv_path}")
+        recent = [p.name for p in list_csvs()[:8]]
+        if recent:
+            print("Recent CSVs:")
+            for r in recent:
+                print("  -", r)
         sys.exit(1)
 
-    # Load and clean
+    # Load
     t, F_N, sample = read_logger_csv(csv_path)
     t, F_N = finite_xy(t, F_N)
-    if len(t) < 2:
+    if t.size < 2:
         print("Not enough valid points to plot.")
         sys.exit(1)
 
     # Stats
-    duration = t[-1] - t[0]
+    duration = float(t[-1] - t[0])
     diffs = np.diff(t)
     diffs = diffs[diffs > 0]
     hz_est = (1.0 / np.median(diffs)) if diffs.size else float("nan")
     idx_max = int(np.nanargmax(F_N))
-    t_max, FmaxN = t[idx_max], F_N[idx_max]
+    t_max, FmaxN = float(t[idx_max]), float(F_N[idx_max])
     FmaxK = FmaxN / N_PER_KGF
 
-    # Areas
-    impulse_Ns = integrate_trapz(F_N, t)       # N·s
-    area_kgf_s = impulse_Ns / N_PER_KGF        # kgf·s
+    # Areas & energy
+    impulse_Ns = integrate_trapezoid(F_N, t)          # N·s
+    area_kgf_s = impulse_Ns / N_PER_KGF               # kgf·s
 
-    # Optional: ask for constant speed to estimate energy
     speed_input = input("Enter crosshead speed in mm/s (blank to skip energy): ").strip()
     energy_J = None
     travel_mm = None
@@ -149,21 +269,28 @@ def main():
             v_mm_s = float(speed_input)
             if v_mm_s > 0:
                 v_m_s = v_mm_s / 1000.0
-                energy_J = integrate_trapz(F_N * v_m_s, t)  # J ≈ ∫ F v dt
+                energy_J = integrate_trapezoid(F_N * v_m_s, t)  # J ≈ ∫ F v dt
                 travel_mm = v_mm_s * duration
-        except:
-            pass  # ignore bad input
+        except Exception:
+            pass
 
-    # Make PDF (one page)
+    # ---------- Make the PDF (one page) ----------
     pdf_path = csv_path.with_suffix(".pdf")
     fig = plt.figure(figsize=(8.5, 11.0), dpi=150)  # US Letter
-    ax = fig.add_axes([0.12, 0.35, 0.83, 0.55])
 
-    # Plot
+    # Main plot area
+    ax = fig.add_axes([0.12, 0.35, 0.83, 0.55])
     ax.plot(t, F_N, linewidth=1.8)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Force (N)")
     ax.grid(True, alpha=0.3)
+
+    # Optional right axis in kgf
+    ax_r = ax.twinx()
+    ax_r.set_ylabel("Force (kgf)")
+    # Sync the right axis ticks to N→kgf
+    ymin, ymax = ax.get_ylim()
+    ax_r.set_ylim(ymin / N_PER_KGF, ymax / N_PER_KGF)
 
     # Max marker
     ax.plot([t_max], [FmaxN], marker="o")
@@ -175,12 +302,11 @@ def main():
     title = f"Force vs Time — {sample}"
     fig.suptitle(title, fontsize=16, y=0.97)
 
-    # Info panel
+    # Info panel (bottom)
     ax2 = fig.add_axes([0.08, 0.10, 0.84, 0.18]); ax2.axis("off")
     lines = [
         f"CSV: {csv_path.name}",
         f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"Sample: {sample}",
         f"Duration: {duration:.3f} s    Est. rate: {hz_est:.2f} Hz",
         f"Max force: {FmaxN:.3f} N ({FmaxK:.3f} kgf)",
         f"Area under curve (impulse): {impulse_Ns:.3f} N·s  ({area_kgf_s:.3f} kgf·s)",
