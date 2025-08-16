@@ -1,5 +1,5 @@
 import time
-from roboclaw import Roboclaw
+from roboclaw import RoboClaw
 
 # Update this with the appropriate serial port identified earlier
 ROBOCLAW_PORT = '/dev/ttyACM0' # Mac: '/dev/tty.usbmodem14301'
