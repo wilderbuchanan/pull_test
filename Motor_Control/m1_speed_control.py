@@ -66,23 +66,22 @@ def next_increment_path(dirpath: str, basename: str, ext: str = ".png") -> str:
             return candidate
         i += 1
 
-def save_relative_plot(times, speeds, refs, out_dir="output_photos"):
-    # speed relative to reference (error)
-    rel = [s - r for s, r in zip(speeds, refs)]
-    path = next_increment_path(out_dir, "speed_relative_to_reference", ".png")
+def save_speed_plot(times, speeds, refs, out_dir="output_photos"):
+    path = next_increment_path(out_dir, "speed_vs_reference", ".png")
 
     plt.figure(figsize=(10, 6))
-    plt.plot(times, rel, label="Speed - Reference")
-    plt.axhline(0, linestyle="--", label="Reference (0)")
+    plt.plot(times, speeds, label="Measured Speed")
+    plt.plot(times, refs, "--", label="Reference Speed")
     plt.xlabel("Time (s)")
-    plt.ylabel("Relative Speed (counts/sec)")
-    plt.title("Motor Speed Relative to Reference")
+    plt.ylabel("Speed (counts/sec)")
+    plt.title("Motor Speed vs Reference")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
     plt.savefig(path, dpi=150)
     plt.close()
     print(f"Saved plot: {path}")
+
 
 def main():
     if rc.Open() == 0:
@@ -146,7 +145,7 @@ def main():
         print("Stopped.")
         # save plot at the end
         if times and speeds and refs:
-            save_relative_plot(times, speeds, refs)
+            save_speed_plot(times, speeds, refs)
 
 if __name__ == "__main__":
     main()
