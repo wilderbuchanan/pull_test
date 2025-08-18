@@ -4,6 +4,7 @@
 #   A) Press 1: save current encoder -> move to (start ± 150000) counts (auto-detected sign)
 #      Logs CSV+PNG; if force >10 N and later <1 N, finish remainder at FULL-speed backward.
 #      Stop when within ±100 of goal OR total travel ≥ 150000-100 from start. Print final encoder.
+#      NEW: light/heavy PID switching based on force (hysteresis) for smooth no-load + strong under load.
 #   B) Press 1 again: return to saved encoder (±25 tol) -> clear saved position
 # Buttons 2/3: full-speed backward/forward while held.
 
@@ -41,8 +42,16 @@ def motor_main():
     ADDR  = 0x80
 
     QPPS  = 4196                    # set to None to auto-measure
-#    KP, KI, KD = 0.35, 0.007, 0.04  # velocity PID
-    KP, KI, KD = 0.55, 0.020, 0.02
+
+    # Keep your "good under load" gains as the heavy set
+    PID_LIGHT = (0.30, 0.004, 0.06)  # smoother at low load
+    PID_HEAVY = (0.55, 0.020, 0.02)  # strong tracking under load
+
+    # Force-based PID switch hysteresis
+    HEAVY_THRESH  = 5.0    # N: switch to heavy if force stays above this
+    LIGHT_THRESH  = 3.0    # N: switch back to light if force stays below this
+    HEAVY_ON_DUR  = 0.5    # seconds above threshold to switch to heavy
+    LIGHT_ON_DUR  = 1.5    # seconds below threshold to switch back to light
 
     TARGET_FRACTION     = 0.60      # slow speed (button 1 retract)
     FULL_SPEED_FRACTION = 0.95      # full speed for hold buttons & return
@@ -60,7 +69,7 @@ def motor_main():
     NEAR_BAND        = 200    # counts: switch to slow speed when inside this band (return phase)
 
     # Position targets for Button 1 slow phase
-    RETRACT_DELTA    = 250000  # counts to move from the start encoder (sign auto-detected)
+    RETRACT_DELTA    = 150000  # counts to move from the start encoder (sign auto-detected)
     RETRACT_TOL      = 100     # counts: acceptable range around target goal
     SLOW_PHASE_TIMEOUT = 300   # ultimate safety (s) so it can’t run forever
 
@@ -85,6 +94,9 @@ def motor_main():
     def fix16(x: float) -> int:
         return int(x * 65536.0)
 
+    def set_velocity_pid(kp, ki, kd, qpps):
+        rc.SetM1VelocityPID(ADDR, fix16(kp), fix16(ki), fix16(kd), int(qpps))
+
     def read_speed():
         out = rc.ReadSpeedM1(ADDR)
         if isinstance(out, tuple) and len(out) >= 2:
@@ -99,10 +111,6 @@ def motor_main():
 
     # --- Incrementing sample prefix (shared PNG/CSV name) ---
     def next_sample_basepath(out_dir: Path) -> Path:
-        """
-        Scan out_dir for files starting with '<number>_' and return a new basepath
-        with the next number and a timestamp, e.g. '003_20250817-1530...'
-        """
         max_n = 0
         pattern = re.compile(r"^(\d+)_")
         for p in out_dir.iterdir():
@@ -117,16 +125,10 @@ def motor_main():
         return out_dir / base  # caller adds .csv / .png
 
     def save_combined_png(png_fullpath: Path, times, speeds, refs, csv_path: Path):
-        """
-        Saves a single figure with two tiled subplots:
-          Top: speed vs reference (slow phase only)
-          Bottom: force (N) vs time from CSV (col2 vs col1)
-        """
-        # Load force CSV (t_rel_s, force_N, force_kgf)
         force_t, force_N = [], []
         try:
             with open(csv_path, "r", encoding="utf-8") as f:
-                r = csv.reader(f); header = next(r, None)
+                r = csv.reader(f); _ = next(r, None)
                 for row in r:
                     if len(row) >= 2:
                         try:
@@ -293,7 +295,8 @@ def motor_main():
 
     def do_slow_retract_and_log(target_slow_cps):
         """Move from start encoder by RETRACT_DELTA counts (sign auto-detected) with logging.
-           Switch to full-speed for remainder if force rule triggers."""
+           Switch to full-speed for remainder if force rule triggers.
+           NEW: PID switches between LIGHT/HEAVY based on measured force (with hysteresis)."""
         nonlocal saved_start_enc
         print("BTN1: START position-based retract/logging.")
 
@@ -327,12 +330,16 @@ def motor_main():
         running_full = False
         next_tick = t0
 
+        # --- PID mode management (start LIGHT for no-load smoothness) ---
+        set_velocity_pid(*PID_LIGHT, QPPS if QPPS else 5000)
+        mode = "light"
+        above_since = None
+        below_since = time.time()
+
         # ---- Auto-detect encoder sign w.r.t. backward command ----
-        # After a short moment, see if counts increased or decreased.
         enc_goal = enc_start - RETRACT_DELTA   # tentative (negative direction)
         sign_checked = False
         sign_window_end = t0 + 0.2  # ~200 ms window to detect sign
-        last_enc = enc_start
 
         try:
             while True:
@@ -343,10 +350,9 @@ def motor_main():
                     print("WARN: Slow phase timeout reached; stopping.")
                     break
 
-                # Encoder read
+                # Encoder read & goal logic
                 ok_e, enc_now = read_enc()
                 if ok_e:
-                    # initial sign check
                     if not sign_checked and now >= sign_window_end:
                         delta = enc_now - enc_start
                         if delta > 0:
@@ -356,21 +362,35 @@ def motor_main():
                             print(f"Auto-detected: backward command decreases counts; goal kept at {enc_goal}")
                         sign_checked = True
 
-                    # Primary stop: close to numeric goal
                     if abs(enc_now - enc_goal) <= RETRACT_TOL:
                         print(f"Reached goal band: enc={enc_now}, goal={enc_goal}, tol=±{RETRACT_TOL}")
                         break
 
-                    # Secondary stop: absolute travel from start (direction-agnostic)
                     if abs(enc_now - enc_start) >= (RETRACT_DELTA - RETRACT_TOL):
                         print(f"Reached travel threshold from start: enc={enc_now}, start={enc_start}, "
                               f"travel≈{abs(enc_now - enc_start)} ≥ {RETRACT_DELTA - RETRACT_TOL}")
                         break
 
-                    last_enc = enc_now
-
-                # Force-based speed switch
+                # ---- Force-based PID switching (hysteresis) ----
                 latest_force, saw_over_10 = ft.snapshot()
+                if latest_force is not None:
+                    if latest_force > HEAVY_THRESH:
+                        above_since = above_since or now
+                        below_since = None
+                    elif latest_force < LIGHT_THRESH:
+                        below_since = below_since or now
+                        above_since = None
+
+                    if mode == "light" and above_since and (now - above_since) >= HEAVY_ON_DUR:
+                        set_velocity_pid(*PID_HEAVY, QPPS if QPPS else 5000)
+                        mode = "heavy"
+                        print(f"[PID] → HEAVY (force {latest_force:.1f} N)")
+                    elif mode == "heavy" and below_since and (now - below_since) >= LIGHT_ON_DUR:
+                        set_velocity_pid(*PID_LIGHT, QPPS if QPPS else 5000)
+                        mode = "light"
+                        print(f"[PID] → LIGHT (force {latest_force:.1f} N)")
+
+                # ---- Force-drop rule: switch commanded speed to FULL for remainder ----
                 if (not running_full) and saw_over_10 and (latest_force is not None) and (latest_force < 1.0):
                     print("Force drop condition met (>10N seen, now <1N) — switching to FULL-SPEED retract for remainder.")
                     rc.SpeedM1(ADDR, full_rev_cps)
@@ -485,8 +505,8 @@ def motor_main():
             print("QPPS measurement failed; using fallback =", qpps)
     print("QPPS =", qpps)
 
-    # ---- PID ----
-    rc.SetM1VelocityPID(ADDR, fix16(KP), fix16(KI), fix16(KD), int(qpps))
+    # ---- PID (initialize to LIGHT so idle/no‑load is calm) ----
+    set_velocity_pid(*PID_LIGHT, qpps)
 
     # ---- Targets ----
     target_slow     = int(TARGET_FRACTION * qpps)
@@ -496,7 +516,8 @@ def motor_main():
     print("Targets (cps): slow =", target_slow,
           " full_fwd =", target_full_fwd, " full_rev =", target_full_rev)
     print("Ready. Press:")
-    print("  * GPIO17: State A -> move by 150000 counts (auto sign, ±100) + log (force-drop → fast); State B -> return to saved encoder (±25)")
+    print("  * GPIO17: State A -> move by 150000 counts (auto sign, ±100) + log (force-drop → fast; PID auto-swap)")
+    print("            State B -> return to saved encoder (±25)")
     print("  * GPIO27: Backward while held (full)")
     print("  * GPIO22: Forward while held (full)")
     print("Press Ctrl+C to quit.")
@@ -538,7 +559,7 @@ def motor_main():
 # -------- ENTRY ----------
 # =========================
 def main():
-    parser = argparse.ArgumentParser(description="Stateful motor controller with position-based retract logging and return.")
+    parser = argparse.ArgumentParser(description="Stateful motor controller with position-based retract logging and return (PID auto-switch).")
     parser.add_argument("mode", nargs="?", default="motor", choices=["motor"])
     args = parser.parse_args()
     if args.mode == "motor":
