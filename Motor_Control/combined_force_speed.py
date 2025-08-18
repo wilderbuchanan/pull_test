@@ -41,7 +41,8 @@ def motor_main():
     ADDR  = 0x80
 
     QPPS  = 4196                    # set to None to auto-measure
-    KP, KI, KD = 0.35, 0.007, 0.04  # velocity PID
+#    KP, KI, KD = 0.35, 0.007, 0.04  # velocity PID
+    KP, KI, KD = 0.55, 0.020, 0.02
 
     TARGET_FRACTION     = 0.60      # slow speed (button 1 retract)
     FULL_SPEED_FRACTION = 0.95      # full speed for hold buttons & return
