@@ -44,14 +44,14 @@ def motor_main():
     QPPS  = 4196                    # set to None to auto-measure
 
     # Keep your "good under load" gains as the heavy set
-    PID_LIGHT = (0.30, 0.004, 0.06)  # smoother at low load
-    PID_HEAVY = (0.55, 0.020, 0.02)  # strong tracking under load
+    PID_LIGHT = (0.37, 0.015, 0.04)  # smoother at low load
+    PID_HEAVY = (0.35, 0.015, 0.04)  # strong tracking under load
 
     # Force-based PID switch hysteresis
-    HEAVY_THRESH  = 5.0    # N: switch to heavy if force stays above this
-    LIGHT_THRESH  = 3.0    # N: switch back to light if force stays below this
-    HEAVY_ON_DUR  = 0.5    # seconds above threshold to switch to heavy
-    LIGHT_ON_DUR  = 1.5    # seconds below threshold to switch back to light
+    HEAVY_THRESH  = 40.0    # N: switch to heavy if force stays above this
+    LIGHT_THRESH  = 15.0    # N: switch back to light if force stays below this
+    HEAVY_ON_DUR  = 2.0    # seconds above threshold to switch to heavy
+    LIGHT_ON_DUR  = 2.0    # seconds below threshold to switch back to light
 
     TARGET_FRACTION     = 0.60      # slow speed (button 1 retract)
     FULL_SPEED_FRACTION = 0.95      # full speed for hold buttons & return
@@ -69,7 +69,7 @@ def motor_main():
     NEAR_BAND        = 200    # counts: switch to slow speed when inside this band (return phase)
 
     # Position targets for Button 1 slow phase
-    RETRACT_DELTA    = 150000  # counts to move from the start encoder (sign auto-detected)
+    RETRACT_DELTA    = 325000  # counts to move from the start encoder (sign auto-detected)
     RETRACT_TOL      = 100     # counts: acceptable range around target goal
     SLOW_PHASE_TIMEOUT = 300   # ultimate safety (s) so it can’t run forever
 
