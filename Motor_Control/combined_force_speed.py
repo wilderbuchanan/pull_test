@@ -44,8 +44,8 @@ def motor_main():
     QPPS  = 4196                    # set to None to auto-measure
 
     # Keep your "good under load" gains as the heavy set
-    PID_LIGHT = (0.37, 0.015, 0.04)  # smoother at low load
-    PID_HEAVY = (0.35, 0.015, 0.04)  # strong tracking under load
+    PID_LIGHT = (0.30, 0.020, 0.04)  # smoother at low load
+    PID_HEAVY = (0.30, 0.020, 0.04)  # strong tracking under load
 
     # Force-based PID switch hysteresis
     HEAVY_THRESH  = 40.0    # N: switch to heavy if force stays above this
@@ -53,7 +53,7 @@ def motor_main():
     HEAVY_ON_DUR  = 2.0    # seconds above threshold to switch to heavy
     LIGHT_ON_DUR  = 2.0    # seconds below threshold to switch back to light
 
-    TARGET_FRACTION     = 0.60      # slow speed (button 1 retract)
+    TARGET_FRACTION     = 0.50      # slow speed (button 1 retract)
     FULL_SPEED_FRACTION = 0.95      # full speed for hold buttons & return
 
     # Pins (BCM)
